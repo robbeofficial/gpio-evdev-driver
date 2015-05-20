@@ -23,3 +23,4 @@ When running the code for the first time, it will ask you to define a keyboard e
 - send key combinations (e.g. ctrl-alt-del)
 - don't use pickle, but something human readable (probably JSON)
 - maybe some arguments to (re)configure stuff
+- allow to send gamepad / joystick events
