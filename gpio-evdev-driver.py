@@ -1,46 +1,38 @@
-import RPi.GPIO as GPIO
-from time import sleep
-import pickle
-from os.path import isfile
+#!/usr/bin/env python
+
+import argparse
+import json
 from evdev import InputDevice, UInput, categorize, ecodes
-from sys import stdout
+from collections import OrderedDict
+import RPi.GPIO as GPIO
+from time import sleep, time
+from string import Template
+import sys
+import os
+import stat
+from os.path import abspath, dirname, isfile
+from subprocess import call
 
-INPUT_PINS = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30] # pins to be polled (all others are ignored)
-NPINS = len(INPUT_PINS)
-CONFIG_FILE_KEYS = 'keys.p' # key configuration (action -> key)
-CONFIG_FILE_GPIO = 'gpio.p' # gpio configuration (action -> gpio pin)
-ACTIONS = ['P1 Left', 'P1 Right', 'P1 Up', 'P1 Down', 'P1 Start', 'P1 Select', 'P1 A', 'P1 B', 'P1 X', 'P1 Y', 'P1 L', 'P1 R'] # list of user actions (should be <= INPUT_PINS)
+PINS = range(27) # BCM pin range
+CONFIG_FILE = "config.json"
+INIT_SCRIPT = 'gpio-evdev-driver.sh'
 POLLING_INTERVAL = 0.01 # in seconds
+DEFAULT_ACTIONS = ['P1 Left', 'P1 Right', 'P1 Up', 'P1 Down', 'P1 Start', 'P1 Select', 'P1 A', 'P1 B', 'P1 X', 'P1 Y', 'P1 L', 'P1 R', 'ESC']
 
-# setup input pins to use pull-up resistors
-def setup_pins():
-	for pin in INPUT_PINS:
-		print("polling pin %d" % pin)
-		GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+# read args
+parser = argparse.ArgumentParser(description="polls GPIO events on the Raspberry Pi and maps them to keyboard events (requires root)")
+parser.add_argument('-k','--assign-keys', action='store_true', help='goes through all actions defined in config.json and assigns keyboard events to be sent')
+parser.add_argument('-p','--assign-pins', action='store_true', help='goes through all actions defined in config.json and assigns GPIO triggers to be monitored')
+parser.add_argument('-d','--device', default='/dev/input/event0', help='keyboard input device (default: /dev/input/event0)')
+parser.add_argument('-t','--test-pins', action='store_true', help='polls all pin states for testing purposes')
+parser.add_argument('-i','--install', action='store_true', help='installs as init script daemon (automatic lauch at boot; always refers to this script location and config.json!)')
+parser.add_argument('-u','--uninstall', action='store_true', help='uninstalls init script daemon')
 
-# polling loop
-def poll(mapping):
-	state = dict(zip(INPUT_PINS,NPINS*[1])) # default pin state (working with low-active signals here)
-	uinput = UInput()
+args = parser.parse_args()
 
-	while True:
-		for pin in INPUT_PINS:
-			pval = state[pin] # previous pin state
-			val = GPIO.input(pin) # current pin state
-		
-			# detect edges
-			if not pval and val: # rising edge
-				#print("rising edge at pin %d -> %s up" % (pin,ecodes.KEY[mapping[pin]]))
-				uinput.write(ecodes.EV_KEY, mapping[pin], 0)  # key up
-				uinput.syn()
-			elif pval and not val: # falling edge
-				#print("falling edge at pin %d -> %s down" % (pin, ecodes.KEY[mapping[pin]]))
-				uinput.write(ecodes.EV_KEY, mapping[pin], 1)  # key down
-				uinput.syn()
-
-			state[pin] = val # update pin state
-
-		sleep(POLLING_INTERVAL) # wait for next polling cycle
+def init_gpio():
+	GPIO.setmode(GPIO.BCM)
+	GPIO.setup(PINS, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 # waits for and returns key down event
 def wait_key(dev):
@@ -48,77 +40,175 @@ def wait_key(dev):
 		if event.type == ecodes.EV_KEY and event.value == 1: # key down
 			return event
 
-# waits for falling edge and returns corresponding input pin 
-def wait_falling_edge():
-	while True:
-		for pin in INPUT_PINS:
+def assign_keys(config):
+	keys = set()
+	keyboard = InputDevice(args.device)
+	for action in config['actions']:
+		print "press key for '%s' ..." % action
+		while True:
+			event = wait_key(keyboard)
+			if event.code not in keys:
+				break
+		keys.add(event.code)
+		config['actions'][action]['key'] = event.code
+	return config
+
+def wait_pins():
+	pressed = set()
+	released = set()
+	while not pressed or not pressed == released:
+		for pin in PINS:
 			if GPIO.input(pin) == 0:
-				return pin
-        sleep(POLLING_INTERVAL)
+				pressed.add(pin)
+			else:
+				if pin in pressed:
+					released.add(pin)
+        	sleep(POLLING_INTERVAL) # waiting between pins yields in better perofrmance
+	return list(pressed)
 
-# print() without linebreak
-def printf(string):
-	stdout.write(string)
-	stdout.flush()
+def assign_pins(config):
+	init_gpio()
+	for action in config['actions']:
+		print "press button for %s ... " % action
+		pins = wait_pins()
+		config['actions'][action]['pins'] = pins
+	return config
 
-# prompts for keyboard events to be sent for each user action (action->key mapping)
-def configure_keys(dev):
-	keys = dict()
-	for action in ACTIONS:
-		printf("press key for %s ... " % action)
-		while True:
-			event = wait_key(dev)
-			if event.code not in keys.values():
-				break
-		printf("%s\n" % ecodes.KEY[event.code])
-		keys[action] = event.code
-	return keys
+def test_pins():
+	init_gpio()
+	while True:
+		vals = []
+		for pin in PINS:
+			vals.append(GPIO.input(pin))
+		print vals
+		sleep(POLLING_INTERVAL)
 
-# prompts for GPIO events that should trigger the user actions (action->pin mapping)
-def configure_gpio():
-	gpio = dict()
-	for action in ACTIONS:
-		printf("press button for %s ... " % action)
-		while True:
-			pin = wait_falling_edge()
-			if pin not in gpio.values():
-				break
-		printf("%d\n" % pin)
-		gpio[action] = pin
-	return gpio
+# writes config to JSON
+def write_config(fname, config):
+	with open(fname, 'w') as f:
+	    json.dump(config, f, indent=4)
 
-# reads action->key mapping from config file, starts configuration if file not yet exists
-def read_keys():
-	if not isfile(CONFIG_FILE_KEYS):
-		keyboard = InputDevice('/dev/input/event0')
-		keys = configure_keys(keyboard)
-		pickle.dump(keys, open(CONFIG_FILE_KEYS,'w'))
+# reads / generates config
+def read_config(fname):
+	if isfile(fname):
+		with open(fname, 'r') as f:
+		    config = json.load(f, object_pairs_hook=OrderedDict)
 	else:
-		keys = pickle.load(open(CONFIG_FILE_KEYS, 'r'))
-	return keys
+		actions = OrderedDict()
+		for action in DEFAULT_ACTIONS:
+			actions[action] = {'pins': [], 'key': None}
+		config = {'actions': actions}
+	return config
 
-# reads action->pin mapping from config file, starts configuration if file not yet exists
-def read_gpio():
-	if not isfile(CONFIG_FILE_GPIO):
-		gpio = configure_gpio()
-		pickle.dump(gpio, open(CONFIG_FILE_GPIO,'w'))
-	else:
-		gpio = pickle.load(open(CONFIG_FILE_GPIO, 'r'))
-	return gpio
+# create mapping
+def create_mapping(config):
+	mapping = {} # pin -> key
+	combinations = [] # (pins, key)
+	for action,d in config['actions'].items():
+		pins = d['pins']
+		key = d['key']
+		if pins and key is not None:
+			print "mapping pin(s) %s to key %d for '%s'" % (str(pins), key, action)
+			if len(pins) == 1:
+				mapping[pins[0]] = key
+			else:
+				combinations.append( (pins, key) )
+	return mapping, combinations
 
-# creates pin->key mapping for all user actions
-def create_mapping(gpio, keys):
-	mapping = dict()
-	for action in ACTIONS:
-		mapping[gpio[action]] = keys[action]
-	return mapping
+# main loop
+def polling_loop(mapping, combinations):
+	init_gpio()
+	uinput = UInput()
 
+	pin_state = [1]*len(PINS)
+	combination_state = [False]*len(combinations)
 
-GPIO.setmode(GPIO.BCM)
-setup_pins()
+	while True:
+		#start = time()
 
-keys = read_keys()
-gpio = read_gpio()
-mapping = create_mapping(gpio, keys)
+		# update pin states and trigger single pin events
+		for pin in PINS:
+			prev = pin_state[pin] # previous pin state
+			curr = GPIO.input(pin) # current pin state
 
-poll(mapping)
+			# detect edges
+			if prev and not curr and pin in mapping: # falling edge
+				uinput.write(ecodes.EV_KEY, mapping[pin], 1)  # key down
+				uinput.syn()
+			elif not prev and curr and pin in mapping: # rising edge
+				uinput.write(ecodes.EV_KEY, mapping[pin], 0)  # key up
+				uinput.syn()
+
+			# update pin state
+			pin_state[pin] = curr
+
+		# query pin combinations
+		for i, (pins, key) in enumerate(combinations):
+			hit = True
+			for pin in pins:
+				if pin_state[pin] == 1:
+					hit = False
+					break
+			if hit and not combination_state[i]:
+				combination_state[i] = True
+				uinput.write(ecodes.EV_KEY, key, 1)  # key down
+				uinput.syn()
+			elif not hit and combination_state[i]:
+				combination_state[i] = False
+				uinput.write(ecodes.EV_KEY, key, 0)  # key up
+				uinput.syn()
+
+		#print time() - start
+
+		# wait for next polling cycle
+		sleep(POLLING_INTERVAL)
+
+# read config
+config = read_config(CONFIG_FILE)
+
+# pin test
+if args.test_pins:
+	test_pins()
+	exit(0)
+
+# assign keys
+if args.assign_keys:
+	config = assign_keys(config)
+	write_config(CONFIG_FILE, config)
+	exit(0)
+
+# assign pins
+if args.assign_pins:
+	config = assign_pins(config)
+	write_config(CONFIG_FILE, config)
+	exit(0)
+
+# install
+init_script_path = '/etc/init.d/' + INIT_SCRIPT
+if args.install:
+	# generate init script
+	template = Template( open(INIT_SCRIPT + '.template').read() )
+	mapping = {'dir': abspath(dirname(sys.argv[0]))}
+	init_script = template.substitute(mapping)
+
+	# install init script
+	open(init_script_path,'w').write(init_script)
+	stats = os.stat(init_script_path)
+	os.chmod(init_script_path, stats.st_mode | stat.S_IEXEC)
+	call(['update-rc.d', INIT_SCRIPT, 'defaults'])
+
+	exit(0)
+
+# uninstall
+if args.uninstall:
+	call(['update-rc.d', INIT_SCRIPT, 'remove'])
+	os.remove(init_script_path)
+	exit(0)
+
+# redirect std streams
+sys.stdout = open("stdout.txt", 'w')
+sys.stderr = open("stderr.txt", 'w')
+
+# run driver mode
+mapping, combinations = create_mapping(config)
+polling_loop(mapping, combinations)
