@@ -13,7 +13,7 @@ import stat
 from os.path import abspath, dirname, isfile
 from subprocess import call
 
-PINS = range(27) # BCM pin range
+PINS = range(28) # BCM pin range
 CONFIG_FILE = "config.json"
 INIT_SCRIPT = 'gpio-evdev-driver.sh'
 POLLING_INTERVAL = 0.01 # in seconds
